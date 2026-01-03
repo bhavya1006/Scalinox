@@ -1,7 +1,5 @@
 import 'dotenv/config';
 import express from 'express';
-import { genkit } from 'genkit';
-import { googleAI } from '@genkit-ai/googleai';
 import OpenAI from 'openai';
 
 // Normalize possible misformatted .env keys with spaces
@@ -9,23 +7,24 @@ function getEnv(name) {
   return process.env[name] || process.env[`${name} `] || process.env[` ${name}`];
 }
 
-if (!getEnv('GOOGLE_GENAI_API_KEY')) {
-  console.warn('[WARN] GOOGLE_GENAI_API_KEY not found. Ensure .env lines use KEY=value without spaces around =');
+// Lightning API URL (ngrok or deployed URL)
+const LIGHTNING_API_URL = getEnv('LIGHTNING_API_URL') || 'https://unthrobbing-norma-premonitory.ngrok-free.dev';
+
+if (!LIGHTNING_API_URL) {
+  console.warn('[WARN] LIGHTNING_API_URL not found. Using default ngrok URL.');
 }
 if (!getEnv('AKASH_CHAT_API_KEY')) {
   console.warn('[WARN] AKASH_CHAT_API_KEY not found. Ensure .env lines use KEY=value without spaces around =');
 }
-
-// Genkit initialization (Gemini)
-export const ai = genkit({
-  plugins: [googleAI({ apiKey: getEnv('GOOGLE_GENAI_API_KEY') })],
-});
 
 // Akash Chat client for prompt refinement
 const akashClient = new OpenAI({
   apiKey: getEnv('AKASH_CHAT_API_KEY'),
   baseURL: 'https://chatapi.akash.network/api/v1',
 });
+
+// Simple in-memory cache to reduce API calls
+const generationCache = new Map();
 
 // Supported styles mapping (pulling Scalinox client styles + legacy ones)
 const stylePrompts = {
@@ -77,8 +76,19 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: '25mb' }));
 
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', model: 'gemini-image', styles: Object.keys(stylePrompts) });
+app.get('/health', async (_req, res) => {
+  // Check Lightning API health
+  try {
+    const response = await fetch(`${LIGHTNING_API_URL}/health`);
+    if (response.ok) {
+      const data = await response.json();
+      res.json({ status: 'ok', model: 'lightning', lightningStatus: data, styles: Object.keys(stylePrompts) });
+    } else {
+      res.json({ status: 'ok', model: 'lightning', lightningStatus: 'unavailable', styles: Object.keys(stylePrompts) });
+    }
+  } catch (e) {
+    res.json({ status: 'ok', model: 'lightning', lightningStatus: 'connection_error', styles: Object.keys(stylePrompts) });
+  }
 });
 
 // Prompt refinement via Akash Chat
@@ -108,11 +118,21 @@ app.post('/refinePrompt', async (req, res) => {
   }
 });
 
-// Image generation using Gemini
+// Image generation using Lightning API
 app.post('/generate', async (req, res) => {
   try {
     const { prompt, style, imageDataUri } = req.body || {};
     const mode = (req.body && req.body.mode) === 'prompt' ? 'prompt' : 'style';
+    const steps = req.body.steps || 10;
+    const guidance = req.body.guidance || 1.5;
+    const negativePrompt = req.body.negativePrompt || 'blurred, low quality, distortion';
+
+    // 1. Check Cache
+    const cacheKey = JSON.stringify({ prompt, style, mode, imageDataUri, steps, guidance });
+    if (generationCache.has(cacheKey)) {
+      console.log('[CACHE] Serving cached response');
+      return res.json(generationCache.get(cacheKey));
+    }
 
     let finalPrompt = '';
     if (mode === 'style') {
@@ -127,20 +147,85 @@ app.post('/generate', async (req, res) => {
       finalPrompt = `${customPromptPrefix}"${prompt.trim()}"`;
     }
 
-    const promptParts = [];
-    if (imageDataUri && typeof imageDataUri === 'string' && imageDataUri.startsWith('data:')) {
-      promptParts.push({ media: { url: imageDataUri } });
+    // Validate image data URI
+    if (!imageDataUri || typeof imageDataUri !== 'string' || !imageDataUri.startsWith('data:')) {
+      return res.status(400).json({ error: 'Valid image data URI required' });
     }
-    promptParts.push({ text: finalPrompt });
 
-    const { media } = await ai.generate({
-      model: 'googleai/gemini-2.0-flash-preview-image-generation',
-      prompt: promptParts,
-      config: { responseModalities: ['TEXT', 'IMAGE'] },
-    });
+    // Extract image data from data URI
+    const match = imageDataUri.match(/^data:(.+);base64,(.+)$/);
+    if (!match) {
+      return res.status(400).json({ error: 'Invalid image data URI format' });
+    }
+    const mimeType = match[1];
+    const base64Data = match[2];
+    const imageBuffer = Buffer.from(base64Data, 'base64');
 
-    if (!media?.url) return res.status(502).json({ error: 'Model did not return image' });
-    res.json({ imageDataUri: media.url, mode });
+    // Prepare FormData for Lightning API (using native FormData + Blob)
+    const formData = new FormData();
+    const blob = new Blob([imageBuffer], { type: mimeType });
+    formData.append('file', blob, 'image.png');
+    formData.append('prompt', finalPrompt);
+    formData.append('negative_prompt', negativePrompt);
+    formData.append('steps', String(steps));
+    formData.append('guidance', String(guidance));
+
+    console.log(`[Lightning] Sending request with prompt: "${finalPrompt.substring(0, 50)}..."`);
+
+    let result;
+    let retries = 3;
+    let delay = 5000; // Start with 5 seconds wait for errors
+
+    while (true) {
+      try {
+        const response = await fetch(`${LIGHTNING_API_URL}/lightning`, {
+          method: 'POST',
+          body: formData,
+          // Don't set Content-Type header - fetch sets it automatically with boundary
+        });
+
+        if (response.ok) {
+          result = await response.arrayBuffer();
+          break; // Success, exit loop
+        } else if (response.status === 429 && retries > 0) {
+          console.warn(`[429] Rate limit hit. Retrying in ${delay / 1000}s...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          retries--;
+          delay *= 2; // Exponential backoff
+        } else {
+          const errorText = await response.text();
+          console.error(`[Lightning] Error ${response.status}: ${errorText}`);
+          return res.status(response.status).json({ error: `Lightning API error: ${errorText}` });
+        }
+      } catch (e) {
+        if (retries > 0) {
+          console.warn(`[Network] Connection error. Retrying in ${delay / 1000}s...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          retries--;
+          delay *= 2;
+        } else {
+          throw e;
+        }
+      }
+    }
+
+    // Convert result to base64 data URI
+    const outputBuffer = Buffer.from(result);
+    const outputBase64 = outputBuffer.toString('base64');
+    const outputDataUri = `data:image/png;base64,${outputBase64}`;
+
+    const responseData = { imageDataUri: outputDataUri, mode };
+    
+    // 2. Save to Cache
+    generationCache.set(cacheKey, responseData);
+    // Keep cache size manageable
+    if (generationCache.size > 100) {
+      const firstKey = generationCache.keys().next().value;
+      generationCache.delete(firstKey);
+    }
+
+    console.log('[Lightning] Generation successful');
+    res.json(responseData);
   } catch (e) {
     console.error('Generate error:', e);
     res.status(500).json({ error: 'Generation service error' });
